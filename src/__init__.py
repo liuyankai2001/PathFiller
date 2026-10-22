@@ -1,5 +1,5 @@
-"""PathFiller 的通路数据对象。"""
+"""PathFiller 的通路与宿主数据对象。"""
 
-from .schemas import Connection, Entity, PathWay
+from .schemas import Connection, Entity, Genome, PathWay
 
-__all__ = ["Entity", "Connection", "PathWay"]
+__all__ = ["Entity", "Connection", "PathWay", "Genome"]

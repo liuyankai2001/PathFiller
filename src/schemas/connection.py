@@ -14,8 +14,8 @@ class Connection:
     direction 取自当前 map 的 KGML reaction.type，不用 R 条目的方程覆盖。
     substrate_ids、product_ids 保留该反应在图中列出的全部底物、产物。
     ec_numbers 保存关联 EC，不表示必须同时补充全部 EC。
-    is_endogenous：None 表示尚未判断，True 表示有宿主注释支持，
-    False 表示已比较但未匹配到宿主注释。
+    is_endogenous 为布尔值，默认 False；与 Genome 匹配后，
+    True 表示至少一个 EC 有宿主注释支持，False 表示未匹配。
     """
 
     source: Entity
@@ -25,4 +25,4 @@ class Connection:
     direction: Literal["irreversible", "reversible", "unknown"] = "unknown"
     substrate_ids: list[str] = field(default_factory=list)
     product_ids: list[str] = field(default_factory=list)
-    is_endogenous: bool | None = None
+    is_endogenous: bool = False

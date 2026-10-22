@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Reviewed on 2026-10-22 against the reference image:
+  https://www.kegg.jp/kegg/pathway/map/map00650.png
+  EC boxes 71 (4.2.1.17) and 205 (4.2.1.150) flank the same vertical,
+  bidirectional arrow from Crotonoyl-CoA to (S)-3-Hydroxybutanoyl-CoA.
+  RN/EC/KO all declare R03026 at both entries but serialize reaction only at 71.
+  Reuse the native RN reaction; the participants and direction below are a
+  checked expectation, not a replacement reaction or an R-equation inference.
+  Apply only to missing entry/R pairs and never overwrite native records.
+-->
+<pathway number="00650" name="path:map00650">
+  <reaction_alias id="205" source_id="71" name="rn:R03026" type="reversible">
+    <substrate id="125" name="cpd:C00877" />
+    <product id="137" name="cpd:C01144" />
+  </reaction_alias>
+</pathway>

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Supplemental diagram records, reviewed against the user-provided KEGG map
+  screenshot on 2026-10-22: https://www.kegg.jp/pathway/map00906
+  EC/KO/RN KGML all omit these six reaction records, although their enzyme
+  entries and R IDs exist. Directions here follow the displayed arrows.
+  R equations resolve the two phytoene isomers; their <=> is NOT map direction.
+  These records are keyed by the reference map, independently of KGML view.
+  They apply only to missing entry/R pairs, never over existing reactions.
+  Entry IDs, R IDs and compound memberships are checked against the RN view.
+-->
+<pathway number="00906" name="path:map00906">
+  <reaction id="325" name="rn:R04218 rn:R07270" type="irreversible">
+    <substrate id="322" name="cpd:C03427" />
+    <product id="327" name="cpd:C05421 cpd:C05413" />
+  </reaction>
+  <reaction id="338" name="rn:R09653" type="irreversible">
+    <substrate id="327" name="cpd:C05421 cpd:C05413" />
+    <product id="333" name="cpd:C19765" />
+  </reaction>
+  <reaction id="347" name="rn:R09692" type="irreversible">
+    <substrate id="327" name="cpd:C05421 cpd:C05413" />
+    <product id="323" name="cpd:C05414" />
+  </reaction>
+  <reaction id="348" name="rn:R09692" type="irreversible">
+    <substrate id="327" name="cpd:C05421 cpd:C05413" />
+    <product id="323" name="cpd:C05414" />
+  </reaction>
+  <reaction id="366" name="rn:R09692" type="irreversible">
+    <substrate id="327" name="cpd:C05421 cpd:C05413" />
+    <product id="323" name="cpd:C05414" />
+  </reaction>
+  <reaction id="367" name="rn:R09692" type="irreversible">
+    <substrate id="327" name="cpd:C05421 cpd:C05413" />
+    <product id="323" name="cpd:C05414" />
+  </reaction>
+</pathway>
