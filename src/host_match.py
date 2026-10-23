@@ -18,7 +18,7 @@ def match_network(graph: nx.MultiDiGraph, genome: Genome) -> nx.MultiDiGraph:
         connection.is_endogenous = bool(connection.ec_numbers & genome.ec_numbers)
         matched += connection.is_endogenous
         unannotated += not connection.ec_numbers
-    logger.info("宿主 EC 匹配完成：%s，%d 种 EC；%d 条反应匹配，%d 条未匹配，其中 %d 条无 EC 注释",
+    logger.debug("宿主 EC 匹配完成：%s，%d 种 EC；%d 条反应匹配，%d 条未匹配，其中 %d 条无 EC 注释",
                 genome.name or "未命名宿主", len(genome.ec_numbers), matched,
                 graph.number_of_edges() - matched, unannotated)
     return graph

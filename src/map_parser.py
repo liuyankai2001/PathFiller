@@ -293,7 +293,7 @@ def _complete_reactions(root: ET.Element, entries: dict) -> tuple[list[ET.Elemen
     if unresolved:
         raise ValueError(f"KGML 仍缺少完整 reaction 记录：{sorted(unresolved)}；不能判断通路起点")
     for item in reused:
-        logger.info("map%s 共用反应连接：酶框 %s 复用酶框 %s 的 %s；保留已有图示方向并合并 EC、KO 注释",
+        logger.debug("map%s 共用反应连接：酶框 %s 复用酶框 %s 的 %s；保留已有图示方向并合并 EC、KO 注释",
                     root.get("number"), item["entry_id"], item["source_entry_id"], "、".join(item["reaction_ids"]))
     return reactions, completed, reused
 

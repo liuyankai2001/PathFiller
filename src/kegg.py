@@ -41,6 +41,87 @@ class KeggRequestError(RuntimeError):
         super().__init__(f"KEGG 请求 {endpoint} 失败（{detail}；已尝试 {attempts} 次）")
 
 
+def _compound_name(value: str) -> str:
+    """选取首个名称，拒绝空值、控制字符及被误当作名称的 C 编号。"""
+    name = value.split(";", 1)[0].strip()
+    if (not name or any(ord(char) < 32 for char in name)
+            or re.fullmatch(r"(?:cpd:)?C[0-9]{5}", name)):
+        raise ValueError("化合物名称为空、含控制字符或只有编号")
+    return name
+
+
+def get_compound_names(
+    compound_ids, *, cache_dir: str | Path | None = None, refresh: bool = False,
+) -> dict[str, str]:
+    """批量获取 KEGG 首个化合物名称；单批失败只记录提示并继续。
+
+    名称缓存为 Cxxxxx.name.txt。仅查询缺失的编号，每批最多十个；请求
+    复用统一限速与重试。返回成功项，缺失项由调用方保留编号或已有名称。
+    """
+    values = [compound_ids] if isinstance(compound_ids, str) else compound_ids
+    identifiers = set()
+    for value in values:
+        if not isinstance(value, str) or re.fullmatch(r"C[0-9]{5}", value.strip().upper()) is None:
+            raise ValueError("化合物编号应为 C 加五位数字，例如 C05432")
+        identifiers.add(value.strip().upper())
+    cache = Path(cache_dir) if cache_dir is not None else DEFAULT_CACHE_DIR
+    names, pending = {}, []
+    for cid in sorted(identifiers):
+        path = cache / f"{cid}.name.txt"
+        if path.exists() and not refresh:
+            try:
+                names[cid] = _compound_name(path.read_text(encoding="utf-8").strip())
+                continue
+            except (OSError, UnicodeError, ValueError) as error:
+                logger.debug("%s 名称缓存无效，将重新查询：%s", cid, error)
+        pending.append(cid)
+    if identifiers:
+        logger.info("化合物名称：共 %d 个，命中缓存 %d 个，待查询 %d 个",
+                    len(identifiers), len(names), len(pending))
+    last_progress = time.monotonic()
+    cache_write_failures = 0
+    for offset in range(0, len(pending), 10):
+        batch = pending[offset:offset + 10]
+        logger.debug("查询化合物名称批次 %d/%d：%s", offset // 10 + 1,
+                     (len(pending) + 9) // 10, ", ".join(batch))
+        try:
+            text = _request_text("list/" + "+".join(batch))
+            fetched = {}
+            for line in text.splitlines():
+                if not line.strip():
+                    continue
+                fields = line.split("\t")
+                cid = fields[0].removeprefix("cpd:")
+                if len(fields) != 2 or cid not in batch or cid in fetched:
+                    raise ValueError("KEGG 化合物名称响应包含无效、重复或未请求的编号")
+                fetched[cid] = _compound_name(fields[1])
+        except (RuntimeError, OSError, UnicodeError, ValueError) as error:
+            logger.debug("化合物名称查询失败（%s），保留编号或已有名称：%s", ", ".join(batch), error)
+            fetched = {}
+        names.update(fetched)
+        for cid, name in fetched.items():
+            try:
+                cache.mkdir(parents=True, exist_ok=True)
+                (cache / f"{cid}.name.txt").write_text(name + "\n", encoding="utf-8")
+            except OSError as error:
+                cache_write_failures += 1
+                logger.debug("%s 名称已获取，但缓存写入失败：%s", cid, error)
+        for cid in sorted(set(batch) - fetched.keys()):
+            logger.debug("KEGG 未返回 %s 的名称，保留编号或已有名称", cid)
+        now = time.monotonic()
+        processed = offset + len(batch)
+        if now - last_progress >= 10 or processed == len(pending):
+            logger.info("名称查询进度：已处理 %d/%d 个待查询化合物，累计获取 %d/%d 个名称",
+                        processed, len(pending), len(names), len(identifiers))
+            last_progress = now
+    if len(names) < len(identifiers):
+        logger.warning("%d 个化合物未获取到名称，保留已有名称或编号；详情见报告或调试日志",
+                       len(identifiers) - len(names))
+    if cache_write_failures:
+        logger.warning("%d 个化合物名称已获取但未能写入缓存；详情见调试日志", cache_write_failures)
+    return dict(sorted(names.items()))
+
+
 def get_maps_by_compound(compound_id: str, *, refresh: bool = False) -> list[str]:
     """通过 C 编号查询关联的全部 map，保留接口返回顺序。
 
@@ -55,10 +136,10 @@ def get_maps_by_compound(compound_id: str, *, refresh: bool = False) -> list[str
         raise ValueError("化合物编号应为 C 加五位数字，例如 C05432")
     if refresh:
         _fetch_maps.cache_clear()
-    logger.info("查询 %s 关联的 map%s", normalized, "（强制刷新）" if refresh else "")
+    logger.debug("查询 %s 关联的 map%s", normalized, "（强制刷新）" if refresh else "")
     # 返回副本，避免调用方修改列表后影响缓存中的数据。
     maps = list(_fetch_maps(normalized))
-    logger.info("%s 关联查询完成：找到 %d 张 map", normalized, len(maps))
+    logger.debug("%s 关联查询完成：找到 %d 张 map", normalized, len(maps))
     return maps
 
 
@@ -76,7 +157,7 @@ def _request_text(endpoint: str) -> str:
                 time.sleep(delay)
             _last_request_started = time.monotonic()
         try:
-            logger.info("请求 KEGG：%s（第 %d/%d 次，超时 30 秒）", endpoint, attempt, _MAX_ATTEMPTS)
+            logger.debug("请求 KEGG：%s（第 %d/%d 次，超时 30 秒）", endpoint, attempt, _MAX_ATTEMPTS)
             with urlopen(request, timeout=30) as response:
                 text = response.read().decode("utf-8")
             logger.debug("KEGG 请求成功：%s", endpoint)
@@ -86,7 +167,7 @@ def _request_text(endpoint: str) -> str:
             retryable = error.code in {408, 429} or 500 <= error.code <= 599
             if not retryable or attempt == _MAX_ATTEMPTS:
                 if error.code == 404:
-                    logger.info("KEGG 资源不存在：%s（HTTP 404，不重试）", endpoint)
+                    logger.debug("KEGG 资源不存在：%s（HTTP 404，不重试）", endpoint)
                 else:
                     logger.error("KEGG 请求失败：%s（HTTP %d，已尝试 %d 次，不再重试）",
                                  endpoint, error.code, attempt)
@@ -106,8 +187,10 @@ def _request_text(endpoint: str) -> str:
         # Full Jitter：第 1～4 次重试前分别从 [0, 1/2/4/8] 秒采样。
         ceiling = min(_BACKOFF_CAP, _BACKOFF_BASE * 2 ** (attempt - 1))
         delay = random.uniform(0, ceiling)
-        logger.warning("KEGG 请求暂时失败：%s（%s）；等待 %.2f 秒后重试（第 %d/%d 次）",
-                       endpoint, reason, delay, attempt + 1, _MAX_ATTEMPTS)
+        if attempt == 1:
+            logger.warning("KEGG 请求暂时失败，正在自动重试：%s", endpoint)
+        logger.debug("KEGG 请求暂时失败：%s（%s）；等待 %.2f 秒后重试（第 %d/%d 次）",
+                     endpoint, reason, delay, attempt + 1, _MAX_ATTEMPTS)
         time.sleep(delay)
 
 
@@ -166,13 +249,13 @@ def parse_map(
     if re.fullmatch(r"map[0-9]{5}", normalized) is None:
         raise ValueError("通路编号应为 map 加五位数字，例如 map00906")
     cache = Path(cache_dir) if cache_dir is not None else DEFAULT_CACHE_DIR
-    logger.info("开始解析 %s：联合读取 RN、EC、KO 视图", normalized)
+    logger.debug("开始解析 %s：联合读取 RN、EC、KO 视图", normalized)
     documents = {}
     for prefix in ("rn", "ec", "ko"):
         view = prefix + normalized[3:]
         kgml_file = cache / f"{view}.kgml"
         use_cache = kgml_file.exists() and not refresh
-        logger.info("%s %s 视图：%s", normalized, prefix.upper(),
+        logger.debug("%s %s 视图：%s", normalized, prefix.upper(),
                     f"读取缓存 {kgml_file.name}" if use_cache else "从 KEGG 下载")
         xml = kgml_file.read_text(encoding="utf-8") if use_cache else _request_text(f"get/{view}/kgml")
         try:
@@ -196,7 +279,7 @@ def parse_map(
         if equation_file.exists() and not refresh:
             logger.debug("读取反应方程缓存：%s", reaction_id)
             return equation_file.read_text(encoding="utf-8").strip()
-        logger.info("获取反应方程 %s，用于确认原图参与物", reaction_id)
+        logger.debug("获取反应方程 %s，用于确认原图参与物", reaction_id)
         equation = _reaction_equation(_request_text(f"get/{reaction_id}"))
         cache.mkdir(parents=True, exist_ok=True)
         equation_file.write_text(equation + "\n", encoding="utf-8")
@@ -206,7 +289,7 @@ def parse_map(
         documents["rn"], ec_xml=documents["ec"], ko_xml=documents["ko"],
         entities=entities, reaction_lookup=lookup,
     )
-    logger.info("%s 解析完成：%d 个化合物、%d 条有向反应", normalized, len(graph), graph.number_of_edges())
+    logger.debug("%s 解析完成：%d 个化合物、%d 条有向反应", normalized, len(graph), graph.number_of_edges())
     return graph
 
 

@@ -59,7 +59,7 @@ def parse_genome(file_path: str | Path) -> Genome:
                     ec_numbers = {ec.strip() for ec in feature.qualifiers.get("EC_number", []) if ec.strip()}
                     annotated_count += bool(ec_numbers)
                     genome.ec_numbers.update(ec_numbers)
-                logger.info("已解析基因组记录 %s；当前累计 %d 个 CDS、%d 种不同 EC",
+                logger.debug("已解析基因组记录 %s；当前累计 %d 个 CDS、%d 种不同 EC",
                             record.id, cds_count, len(genome.ec_numbers))
     except OSError as error:
         logger.error("读取基因组文件失败：%s；%s", path, error)

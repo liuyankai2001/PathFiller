@@ -75,6 +75,21 @@ class MinimumEcResult(SearchResult):
     extra_ecs: set[str] = field(default_factory=set)
 
 
+@dataclass
+class MinimumEcPathsResult:
+    """前 N 条不同反应路线；前 N 条已确定与全部路线已穷尽分别记录。"""
+
+    candidates: list[MinimumEcResult]
+    requested_count: int
+    data_is_complete: bool
+    search_complete: bool
+    exhausted: bool
+    is_complete: bool
+    failures: list[SearchFailure]
+    graphs: dict[str, nx.MultiDiGraph]
+    skipped_maps: dict[str, str]
+
+
 _MAP_ID = re.compile(r"map[0-9]{5}")
 _TCA = "map00020"
 
@@ -120,10 +135,10 @@ def _initial_maps(target: str, cache: Path, refresh: bool) -> list[str]:
     path = cache / f"{target}.maps.json"
     cached = path.exists() and not refresh
     if cached:
-        logger.info("读取 %s 的关联 map 缓存：%s", target, path.name)
+        logger.debug("读取 %s 的关联 map 缓存：%s", target, path.name)
         record = json.loads(path.read_text(encoding="utf-8"))
     else:
-        logger.info("获取 %s 的关联 map 列表", target)
+        logger.debug("获取 %s 的关联 map 列表", target)
         record = {
             "target_id": target,
             "maps": kegg.get_maps_by_compound(target, refresh=refresh),
@@ -138,7 +153,7 @@ def _initial_maps(target: str, cache: Path, refresh: bool) -> list[str]:
         cache.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
     maps = sorted(set(record["maps"]))
-    logger.info("初始关联图共 %d 张：%s", len(maps), "、".join(maps) or "无")
+    logger.debug("初始关联图共 %d 张：%s", len(maps), "、".join(maps) or "无")
     return maps
 
 
@@ -156,13 +171,13 @@ class _MapLoader:
         failure = SearchFailure(map_id, compound, stage, str(reason))
         if failure not in self.failures:
             self.failures.append(failure)
-            logger.warning("%s / %s：%s失败：%s", map_id or "初始查询", compound,
+            logger.debug("%s / %s：%s失败：%s", map_id or "初始查询", compound,
                            _STAGES.get(stage, stage), reason)
 
     def map_error(self, map_id, compound, stage, error):
         if isinstance(error, kegg.KeggRequestError) and error.status_code == 404:
             self.skipped_maps[map_id] = f"{stage}: {error}"
-            logger.info("跳过 %s：%s返回 HTTP 404；该图排除在搜索范围外，不影响数据完整性",
+            logger.debug("跳过 %s：%s返回 HTTP 404；该图排除在搜索范围外，不影响数据完整性",
                         map_id, _STAGES.get(stage, stage))
         else:
             self.failed_maps[map_id] = (stage, str(error))
@@ -186,11 +201,11 @@ class _MapLoader:
                 self.map_error(map_id, compound, "classification", error)
                 return None
         if not self.eligible[map_id]:
-            logger.info("筛除 %s：%s", map_id, "总图、概览图或结构图" if _special_map(map_id)
+            logger.debug("筛除 %s：%s", map_id, "总图、概览图或结构图" if _special_map(map_id)
                         else "不属于普通详细代谢图")
             return None
         if map_id not in self.graphs:
-            logger.info("加载 %s，核对接入化合物 %s", map_id, compound)
+            logger.debug("加载 %s，核对接入化合物 %s", map_id, compound)
             try:
                 graph = kegg.parse_map(
                     map_id, entities=self.entities, cache_dir=self.cache, refresh=self.refresh,
@@ -269,44 +284,58 @@ class PathwayNetwork:
 
 
 def find_minimum_ec_path(network: PathwayNetwork, genome: Genome) -> MinimumEcResult:
-    """自动匹配宿主，排除路线内部循环，再最小化 (不同补充 EC 数, 反应步数)。
+    """兼容单路线调用；与批量接口使用同一个有序搜索内核。"""
+    result = find_minimum_ec_paths(network, genome, top_n=1)
+    if result.candidates:
+        return result.candidates[0]
+    return MinimumEcResult(None, result.is_complete, result.failures, [],
+                           result.graphs, result.skipped_maps, set())
 
-    状态还保存下游路线及待上游消解的依赖，避免按当前化合物丢失有效分支。
-    无 EC 注释的边不参加搜索；未检查其他共底物供应，不设隐式数量上限。
+
+def find_minimum_ec_paths(network: PathwayNetwork, genome: Genome, *, top_n: int = 3) -> MinimumEcPathsResult:
+    """直接搜索前 N 条反应路线，同一路线只保留最优 EC 覆盖方案。
+
+    排名为不同补充 EC 数、反应步数、补充 EC 字典序，再按稳定遍历次序。
+    top_n 是输出数量，不是枚举预览上限；无 EC 边不参加搜索。
     """
+    if type(top_n) is not int or top_n < 1:
+        raise ValueError("top_n 必须是正整数")
     started = perf_counter()
     match_network(network.graph, genome)
-    target = network.target_id
-    logger.info("开始最少补酶搜索：%d 个 TCA 接点 → %s；先比较不同补充 EC 数，再比较反应步数",
-                len(network.terminal_nodes), target)
-    pathway, trace, extra_ecs = _find_acyclic_path(network, host_aware=True)
-    if pathway is None:
-        logger.info("最少补酶搜索结束：有 EC 注释且无内部循环依赖的当前网络内没有路线；数据%s",
-                    "完整" if network.is_complete else "不完整")
-    else:
-        logger.info("%s：需补 %d 种 EC（%s），共 %d 步，用时 %.2f 秒；未检查全部共底物供应",
-                    "找到范围内最少补酶候选" if network.is_complete else "找到当前最佳补酶候选（数据不完整）",
-                    len(extra_ecs), "、".join(sorted(extra_ecs)) or "无需补充", len(pathway.connections),
-                    perf_counter() - started)
-    return MinimumEcResult(pathway, network.is_complete, list(network.failures), trace,
-                           network.graphs, dict(network.skipped_maps), extra_ecs)
+    logger.info("宿主匹配完成，开始搜索前 %d 条补酶候选：%d 个 TCA 接点 → %s",
+                top_n, len(network.terminal_nodes), network.target_id)
+    routes, exhausted = _find_acyclic_paths(network, host_aware=True, top_n=top_n)
+    candidates = [MinimumEcResult(pathway, network.is_complete, list(network.failures), trace,
+                                  network.graphs, dict(network.skipped_maps), ecs)
+                  for pathway, trace, ecs in routes]
+    logger.info("补酶搜索完成：请求 %d 条，返回 %d 条；全部穷尽：%s；数据%s；用时 %.2f 秒",
+                top_n, len(candidates), "是" if exhausted else "否",
+                "完整" if network.is_complete else "不完整，结果为当前网络候选", perf_counter() - started)
+    return MinimumEcPathsResult(candidates, top_n, network.is_complete, True, exhausted,
+                                network.is_complete, list(network.failures), network.graphs,
+                                dict(network.skipped_maps))
 
 
 def _find_acyclic_path(network: PathwayNetwork, *, host_aware: bool):
-    """反向 A*，以乐观下界排序，精确保留不同 EC 数、步数及 EC 字典序目标。
+    routes, _ = _find_acyclic_paths(network, host_aware=host_aware, top_n=1)
+    return routes[0] if routes else (None, [], set())
 
-    上游反应可用净产物消解循环依赖；否则仅在 TCA 接点没有未消解依赖时接受。
-    两个状态的下游节点或待消解依赖不同，会影响后续选择，不能合并。
+
+def _find_acyclic_paths(network: PathwayNetwork, *, host_aware: bool, top_n: int):
+    """反向 A* 的有序前缀；状态保留边路径，避免等价状态吞掉其他路线。
+
+    同一边序列不同 EC 选择中，第一次出队的终点就是该路线最优覆盖。
+    只在输出时去掉重复路线；其状态仍可扩展到更上游的 TCA 接点。
     """
     graph, target = network.graph, network.target_id
     if target not in graph:
-        return None, [], set()
+        return [], True
     eligible = nx.subgraph_view(graph, filter_edge=lambda a, b, key:
                                not host_aware or bool(graph[a][b][key]["connection"].ec_numbers))
     allowed = nx.ancestors(eligible, target) | {target}
     sources = network.terminal_nodes & allowed
     if not sources:
-        return None, [], set()
+        return [], True
     incoming = {
         node: sorted((edge for edge in graph.in_edges(node, keys=True, data=True)
                       if edge[0] in allowed and (not host_aware or edge[3]["connection"].ec_numbers)),
@@ -322,7 +351,7 @@ def _find_acyclic_path(network: PathwayNetwork, *, host_aware: bool):
                 distances[following] = distances[node] + 1
                 todo.append(following)
     if target not in distances:
-        return None, [], set()
+        return [], True
 
     def ec_lower_bound(node, selected, downstream):
         if not host_aware:
@@ -344,38 +373,45 @@ def _find_acyclic_path(network: PathwayNetwork, *, host_aware: bool):
         return 1
 
     serial = count()
-    queue, seen, parents = [], set(), {}
+    queue, seen = [], set()
+    routes, emitted = [], set()
 
     def push(state, steps):
-        node, selected, downstream, _ = state
+        node, selected, downstream, _, _ = state
         extra = ec_lower_bound(node, selected, downstream)
         # 未知新 EC 使用空字符串作字典序下界；全局步数下界不考虑循环约束。
         heappush(queue, (len(selected) + extra, steps + distances[node],
                         ("",) * extra + tuple(sorted(selected)), next(serial), steps, state))
 
-    initial = (target, frozenset(), frozenset({target}), frozenset())
+    initial = (target, frozenset(), frozenset({target}), frozenset(), ())
     seen.add(initial)
-    parents[initial] = None
     push(initial, 0)
     settled = rejected = 0
+    last_progress = perf_counter()
     while queue:
         _, _, _, _, steps, state = heappop(queue)
-        node, selected, downstream, obligations = state
+        node, selected, downstream, obligations, path = state
         settled += 1
         if settled == 1 or settled % 10000 == 0:
-            logger.info("%s已处理 %d 个状态；当前 %d 种补充 EC、%d 步，待处理 %d 个状态；已排除 %d 个循环候选",
+            logger.debug("%s已处理 %d 个状态；当前 %d 种补充 EC、%d 步，待处理 %d 个状态；已排除 %d 个循环候选",
                         "最少补酶搜索" if host_aware else "最少步数搜索", settled, len(selected), steps, len(queue), rejected)
+            now = perf_counter()
+            if now - last_progress >= 10:
+                logger.info("搜索进行中：已找到 %d/%d 条候选", len(routes), top_n)
+                last_progress = now
         if node in sources and not obligations:
-            connections, trace = [], []
-            while parents[state] is not None:
-                following, edge_key = parents[state]
-                data = graph[state[0]][following[0]][edge_key]
-                connections.append(data["connection"])
-                trace.append(data["event"])
-                state = following
-            logger.info("路线依赖检查完成：处理 %d 个状态，排除 %d 个含内部循环依赖的 TCA 候选", settled, rejected)
-            name = f"TCA → {target}" + ("（最少补酶）" if host_aware else "")
-            return PathWay(name, connections), trace, set(selected)
+            if path not in emitted:
+                emitted.add(path)
+                connections = [graph[a][b][key]["connection"] for a, b, key in path]
+                trace = [graph[a][b][key]["event"] for a, b, key in path]
+                name = f"TCA → {target}" + ("（最少补酶）" if host_aware else "")
+                routes.append((PathWay(name, connections), trace, set(selected)))
+                logger.debug("已找到候选 %d/%d：%s → %s；需补 %d 种 EC（%s），共 %d 步",
+                            len(routes), top_n, node, target, len(selected),
+                            "、".join(sorted(selected)) or "无需补充", steps)
+                if len(routes) == top_n:
+                    # 尚未展开本终点的上游，不能因队列暂空就声称全部穷尽。
+                    return routes, False
         if node in sources and obligations:
             rejected += 1
         for source, _, edge_key, data in incoming[node]:
@@ -388,14 +424,14 @@ def _find_acyclic_path(network: PathwayNetwork, *, host_aware: bool):
             options = (None,) if not host_aware or connection.is_endogenous else sorted(connection.ec_numbers)
             for ec in options:
                 updated = selected if ec is None else selected | {ec}
-                successor = (source, updated, downstream | {source}, frozenset(unresolved))
+                successor = (source, updated, downstream | {source}, frozenset(unresolved),
+                             ((source, node, edge_key),) + path)
                 if successor in seen:
                     continue
                 seen.add(successor)
-                parents[successor] = (state, edge_key)
                 push(successor, steps + 1)
-    logger.info("路线依赖检查结束：处理 %d 个状态，排除 %d 个循环候选，未找到可接受路线", settled, rejected)
-    return None, [], set()
+    logger.debug("路线依赖检查结束：处理 %d 个状态，排除 %d 个循环候选，穷尽后共 %d 条候选", settled, rejected, len(routes))
+    return routes, True
 
 
 class PathwayEnumeration(Iterator[CandidatePath]):
@@ -541,7 +577,7 @@ class _NetworkBuilder(_MapLoader):
         self.assembled.add(map_id)
         new_nodes = len(self.network) - before_nodes
         new_edges = self.network.number_of_edges() - before_edges
-        logger.info("已接入 %s：新增 %d 个化合物、%d 条反应，合并 %d 个共享化合物、%d 条重复反应；"
+        logger.debug("已接入 %s：新增 %d 个化合物、%d 条反应，合并 %d 个共享化合物、%d 条重复反应；"
                     "当前共 %d 个化合物、%d 条反应", map_id, new_nodes, new_edges,
                     len(graph) - new_nodes, graph.number_of_edges() - new_edges,
                     len(self.network), self.network.number_of_edges())
@@ -555,7 +591,7 @@ class _NetworkBuilder(_MapLoader):
             maps = []
         for map_id in maps:
             if self.assemble(map_id, self.target) is not None and map_id == _TCA:
-                logger.info("目标 %s 本身位于 TCA 图 map00020，允许零反应路线", self.target)
+                logger.debug("目标 %s 本身位于 TCA 图 map00020，允许零反应路线", self.target)
                 self.terminals.add(self.target)
                 self.network.graph["terminal_origins"][self.target] = [{"map_id": _TCA, "kind": "initial_map"}]
         round_number = 0
@@ -564,7 +600,7 @@ class _NetworkBuilder(_MapLoader):
             reachable = nx.ancestors(self.network, self.target) | {self.target}
             before = len(self.assembled)
             round_number += 1
-            logger.info("第 %d 轮上游扩展：%d 张图中，目标有 %d 个全局上游化合物（含目标），重新检查跨图链接",
+            logger.info("组网进度：第 %d 轮，已接入 %d 张 map，上游化合物 %d 个",
                         round_number, before, len(reachable))
             for map_id in sorted(self.assembled):
                 if map_id == _TCA or (map_id, None) in self.invalid_links:
@@ -596,16 +632,16 @@ class _NetworkBuilder(_MapLoader):
                         self.processed_links.add(link)
                         if destination == _TCA:
                             if contact not in self.terminals:
-                                logger.info("找到 TCA 接点：%s 中的 %s 明确链接 map00020", map_id, contact)
+                                logger.debug("找到 TCA 接点：%s 中的 %s 明确链接 map00020", map_id, contact)
                             self.terminals.add(contact)
                             self.network.graph["terminal_origins"].setdefault(contact, []).append(
                                 {"map_id": map_id, "linked_map": _TCA, "kind": "map_link"})
                         else:
                             if destination not in self.assembled and destination not in self.failed_maps and destination not in self.skipped_maps:
-                                logger.info("发现上游图：%s 的 %s 链接到 %s", map_id, contact, destination)
+                                logger.debug("发现上游图：%s 的 %s 链接到 %s", map_id, contact, destination)
                             self.assemble(destination, contact)
             if len(self.assembled) == before:
-                logger.info("上游扩展结束：没有新的可达 map 需要接入")
+                logger.debug("上游扩展结束：没有新的可达 map 需要接入")
                 break
         initial = (self.target,) if self.target in self.network else ()
         terminal = frozenset(self.terminals)
@@ -628,7 +664,8 @@ def build_pathway_network(target_id: str, *, cache_dir: str | Path | None = None
     cache = Path(cache_dir) if cache_dir is not None else kegg.DEFAULT_CACHE_DIR
     target = target_id.strip().upper()
     started = perf_counter()
-    logger.info("开始构建 %s 的合并代谢网络；缓存目录：%s；%s", target, cache,
+    logger.info("开始构建 %s 的合并代谢网络", target)
+    logger.debug("缓存目录：%s；%s", cache,
                 "强制刷新数据" if refresh else "优先复用缓存")
     result = _NetworkBuilder(target, cache, refresh).run()
     logger.info("组网完成：接入 %d 张 map、%d 个化合物、%d 条反应，找到 %d 个 TCA 接点；"
@@ -636,4 +673,7 @@ def build_pathway_network(target_id: str, *, cache_dir: str | Path | None = None
                 len(result.graph.graph["map_metadata"]), len(result.graph), result.graph.number_of_edges(),
                 len(result.terminal_nodes), len(result.skipped_maps), len(result.failures),
                 "完整" if result.is_complete else "不完整", perf_counter() - started)
+    if result.failures:
+        logger.warning("有 %d 条异常记录，结果仅适用于当前网络；详情见报告或使用 --verbose 查看",
+                       len(result.failures))
     return result
