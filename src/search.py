@@ -15,7 +15,7 @@ import networkx as nx
 
 from . import kegg
 from .logging_config import get_logger
-from .host_match import match_network
+from .host_match import match_network, minimum_ec_cover
 from .pathway_validation import analyze_pathway_dependencies
 from .schemas import Connection, Entity, Genome, PathWay
 
@@ -77,7 +77,7 @@ class MinimumEcResult(SearchResult):
 
 @dataclass
 class MinimumEcPathsResult:
-    """前 N 条不同反应路线；前 N 条已确定与全部路线已穷尽分别记录。"""
+    """前 N 套不同补酶集合及最短代表路线；排名完成与方案穷尽分别记录。"""
 
     candidates: list[MinimumEcResult]
     requested_count: int
@@ -293,22 +293,22 @@ def find_minimum_ec_path(network: PathwayNetwork, genome: Genome) -> MinimumEcRe
 
 
 def find_minimum_ec_paths(network: PathwayNetwork, genome: Genome, *, top_n: int = 3) -> MinimumEcPathsResult:
-    """直接搜索前 N 条反应路线，同一路线只保留最优 EC 覆盖方案。
+    """直接搜索前 N 套不同补酶集合，每套保留最短合法代表路线。
 
-    排名为不同补充 EC 数、反应步数、补充 EC 字典序，再按稳定遍历次序。
-    top_n 是输出数量，不是枚举预览上限；无 EC 边不参加搜索。
+    同一路线允许所有并列最少的 EC 覆盖。排名为补充 EC 数、代表路线
+    步数、EC 字典序，再按稳定遍历次序。无 EC 边不参加搜索。
     """
     if type(top_n) is not int or top_n < 1:
         raise ValueError("top_n 必须是正整数")
     started = perf_counter()
     match_network(network.graph, genome)
-    logger.info("宿主匹配完成，开始搜索前 %d 条补酶候选：%d 个 TCA 接点 → %s",
+    logger.info("宿主匹配完成，开始搜索前 %d 套补酶方案：%d 个 TCA 接点 → %s",
                 top_n, len(network.terminal_nodes), network.target_id)
     routes, exhausted = _find_acyclic_paths(network, host_aware=True, top_n=top_n)
     candidates = [MinimumEcResult(pathway, network.is_complete, list(network.failures), trace,
                                   network.graphs, dict(network.skipped_maps), ecs)
                   for pathway, trace, ecs in routes]
-    logger.info("补酶搜索完成：请求 %d 条，返回 %d 条；全部穷尽：%s；数据%s；用时 %.2f 秒",
+    logger.info("补酶搜索完成：请求 %d 套，返回 %d 套；全部方案穷尽：%s；数据%s；用时 %.2f 秒",
                 top_n, len(candidates), "是" if exhausted else "否",
                 "完整" if network.is_complete else "不完整，结果为当前网络候选", perf_counter() - started)
     return MinimumEcPathsResult(candidates, top_n, network.is_complete, True, exhausted,
@@ -322,10 +322,10 @@ def _find_acyclic_path(network: PathwayNetwork, *, host_aware: bool):
 
 
 def _find_acyclic_paths(network: PathwayNetwork, *, host_aware: bool, top_n: int):
-    """反向 A* 的有序前缀；状态保留边路径，避免等价状态吞掉其他路线。
+    """反向 A*；状态保留完整边路径，输出时才按补酶集合分组。
 
-    同一边序列不同 EC 选择中，第一次出队的终点就是该路线最优覆盖。
-    只在输出时去掉重复路线；其状态仍可扩展到更上游的 TCA 接点。
+    同路径的并列最少覆盖均可输出；重复集合和非最少覆盖仍继续扩展，
+    因为更上游的反应可能产生另一条合法代表路线。普通步数搜索按路径去重。
     """
     graph, target = network.graph, network.target_id
     if target not in graph:
@@ -375,6 +375,7 @@ def _find_acyclic_paths(network: PathwayNetwork, *, host_aware: bool, top_n: int
     serial = count()
     queue, seen = [], set()
     routes, emitted = [], set()
+    minimum_counts = {}
 
     def push(state, steps):
         node, selected, downstream, _, _ = state
@@ -397,17 +398,24 @@ def _find_acyclic_paths(network: PathwayNetwork, *, host_aware: bool, top_n: int
                         "最少补酶搜索" if host_aware else "最少步数搜索", settled, len(selected), steps, len(queue), rejected)
             now = perf_counter()
             if now - last_progress >= 10:
-                logger.info("搜索进行中：已找到 %d/%d 条候选", len(routes), top_n)
+                logger.info("搜索进行中：已找到 %d/%d%s", len(routes), top_n,
+                            " 套方案" if host_aware else " 条路线")
                 last_progress = now
         if node in sources and not obligations:
-            if path not in emitted:
-                emitted.add(path)
+            if host_aware and path not in minimum_counts:
+                choices = [graph[a][b][key]["connection"].ec_numbers for a, b, key in path
+                           if not graph[a][b][key]["connection"].is_endogenous]
+                minimum_counts[path] = len(minimum_ec_cover(choices))
+            minimum = not host_aware or len(selected) == minimum_counts[path]
+            identity = selected if host_aware else path
+            if minimum and identity not in emitted:
+                emitted.add(identity)
                 connections = [graph[a][b][key]["connection"] for a, b, key in path]
                 trace = [graph[a][b][key]["event"] for a, b, key in path]
                 name = f"TCA → {target}" + ("（最少补酶）" if host_aware else "")
                 routes.append((PathWay(name, connections), trace, set(selected)))
-                logger.debug("已找到候选 %d/%d：%s → %s；需补 %d 种 EC（%s），共 %d 步",
-                            len(routes), top_n, node, target, len(selected),
+                logger.debug("已找到%s %d/%d：%s → %s；需补 %d 种 EC（%s），共 %d 步",
+                            "方案" if host_aware else "路线", len(routes), top_n, node, target, len(selected),
                             "、".join(sorted(selected)) or "无需补充", steps)
                 if len(routes) == top_n:
                     # 尚未展开本终点的上游，不能因队列暂空就声称全部穷尽。
@@ -430,7 +438,8 @@ def _find_acyclic_paths(network: PathwayNetwork, *, host_aware: bool, top_n: int
                     continue
                 seen.add(successor)
                 push(successor, steps + 1)
-    logger.debug("路线依赖检查结束：处理 %d 个状态，排除 %d 个循环候选，穷尽后共 %d 条候选", settled, rejected, len(routes))
+    logger.debug("路线依赖检查结束：处理 %d 个状态，排除 %d 个循环候选，穷尽后共 %d%s",
+                 settled, rejected, len(routes), " 套方案" if host_aware else " 条路线")
     return routes, True
 
 

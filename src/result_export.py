@@ -1,4 +1,4 @@
-"""统一导出前 N 条候选、中文报告、路线 SVG 和完整网络。"""
+"""统一导出前 N 套不同补酶方案、代表路线 SVG 和完整网络。"""
 
 from collections.abc import Mapping
 from copy import deepcopy
@@ -77,8 +77,13 @@ def _candidate_record(network, genome, candidate, rank):
         raise ValueError("候选必须包含有效路线，且连接数量与追溯步骤一致")
     matched = compare_pathway(pathway, genome)
     expected = matched["one_minimum_extra_ec_set_under_or_assumption"]
-    if expected is None or set(expected) != candidate.extra_ecs:
+    selected = set(candidate.extra_ecs)
+    if (expected is None or len(expected) != len(selected) or selected & genome.ec_numbers
+            or any(not step["is_endogenous"] and not selected.intersection(step["ec_candidates"])
+                   for step in matched["steps"])):
         raise ValueError("候选需补 EC 与当前宿主的精确覆盖不一致，请重新搜索")
+    # compare_pathway 默认给字典序最小的一组；报告必须展示本方案选定的并列最优组。
+    matched["one_minimum_extra_ec_set_under_or_assumption"] = sorted(selected)
     if matched["route_review"]["circular_dependencies"]:
         raise ValueError("候选存在内部循环依赖，不能作为合格路线导出")
     start = pathway.connections[0].source.id if pathway.connections else network.target_id
@@ -119,6 +124,7 @@ def _route_graph(network, record, edges):
     graph.graph["terminal_nodes"] = frozenset({record["start_id"]})
     graph.graph["initial_nodes"] = (network.target_id,)
     graph.graph["candidate_rank"] = record["rank"]
+    graph.graph["candidate_unit"] = "extra_ec_set"
     graph.graph["extra_ecs"] = record["extra_ecs"]
     graph.graph["terminal_origins"] = {
         record["start_id"]: deepcopy(network.graph.graph.get("terminal_origins", {}).get(record["start_id"], []))}
@@ -140,17 +146,18 @@ def _compound_label(cid, names):
 
 def _status(report):
     if not report["search_complete"]:
-        return "前 N 条搜索尚未完成，当前候选未确认完整排名"
+        return "前 N 套方案搜索尚未完成，当前方案未确认完整排名"
     if not report["data_is_complete"]:
         return "当前网络候选，数据不完整，不能确认搜索范围内全局最优"
-    return "已确认当前搜索范围内的前 N 条候选" if report["candidates"] else "当前搜索范围内没有路线"
+    return "已确认当前搜索范围内的前 N 套补酶方案" if report["candidates"] else "当前搜索范围内没有路线"
 
 
 def _write_report(path, report):
-    lines = [f"# {report['target_id']} 补酶候选报告", "", _status(report), "",
+    lines = [f"# {report['target_id']} 补酶方案报告", "", _status(report), "",
              f"宿主：{_cell(report['host']['name'] or '未命名宿主')}；EC 数：{report['host']['ec_count']}。", "",
-             f"请求 {report['requested_count']} 条，实际返回 {report['returned_count']} 条；"
-             f"前 N 条判定完成：{report['search_complete']}；全部路线穷尽：{report['exhausted']}。", "",
+             f"请求 {report['requested_count']} 套，实际返回 {report['returned_count']} 套；"
+             f"前 N 套判定完成：{report['search_complete']}；全部方案穷尽：{report['exhausted']}。", "",
+             "每套方案按需补 EC 集合区分，展示其最短合法代表路线。", "",
              "| 排名 | 起点 | 需补 EC 数 | 需补 EC | 反应步数 | 路线图 |",
              "| ---: | --- | ---: | --- | ---: | --- |"]
     for record in report["candidates"]:
@@ -161,8 +168,8 @@ def _write_report(path, report):
     if report["network_svg_file"]:
         lines += ["", f"[查看完整网络 SVG]({report['network_svg_file']})。节点名称和反应 EC 在悬停时显示。"]
     if report["route_colors"]:
-        lines += ["", "大图候选颜色：" + "；".join(
-            f"候选 {rank} `{color}`" for rank, color in report["route_colors"].items()) + "。",
+        lines += ["", "大图方案颜色：" + "；".join(
+            f"方案 {rank} `{color}`" for rank, color in report["route_colors"].items()) + "。",
             "共享反应使用多色并列线；独立候选图仍以绿／红表示宿主匹配。"]
     if not report["candidates"]:
         lines += ["", "数据不完整，暂未找到路线。" if not report["is_complete"] else "没有符合条件的路线。"]
@@ -170,7 +177,8 @@ def _write_report(path, report):
         review = record["route_review"]
         background = sorted({cid for item in review["unverified_substrates"] for cid in item["compound_ids"]})
         names = record["compound_names"]
-        lines += ["", f"## 候选 {record['rank']}", "",
+        lines += ["", f"## 方案 {record['rank']}", "",
+                  "需补 EC：" + (", ".join(record["extra_ecs"]) or "无需补充") + "。", "",
                   " → ".join(_cell(_compound_label(cid, names)) for cid in record["compound_ids"]), "",
                   "内部循环检查：未发现内部循环依赖。",
                   f"其他原料供应未核查：{', '.join(background) or '图示记录未列出其他原料'}。", "",
@@ -204,13 +212,16 @@ def export_results(network: PathwayNetwork, genome: Genome, result: MinimumEcPat
     时查询全网名称，并在候选图之后导出按候选着色的完整 network.svg。
     """
     directory = check_output_directory(output_dir)
+    sets = [frozenset(candidate.extra_ecs) for candidate in result.candidates]
+    if len(sets) != len(set(sets)):
+        raise ValueError("候选包含重复的补酶 EC 集合，请按方案重新搜索")
     match_network(network.graph, genome)
     records, paths = [], []
     for rank, candidate in enumerate(result.candidates, 1):
         record, edges = _candidate_record(network, genome, candidate, rank)
         records.append(record)
         paths.append(edges)
-    logger.info("正在导出 %d 条候选的报告和路线图%s", len(records),
+    logger.info("正在导出 %d 套补酶方案的报告和代表路线图%s", len(records),
                 "，并生成完整网络 SVG" if include_network_svg else "")
     compound_ids = sorted(network.graph) if include_network_svg else sorted(
         {cid for record in records for cid in record["compound_ids"]})
@@ -231,6 +242,7 @@ def export_results(network: PathwayNetwork, genome: Genome, result: MinimumEcPat
             step["target_name"] = record["compound_names"][step["target_id"]]
     report = {
         "schema": "pathfiller.minimum_ec_paths.v1", "schema_version": 1,
+        "candidate_unit": "extra_ec_set",
         "target_id": network.target_id,
         "host": {"name": genome.name, "file_path": genome.file_path, "ec_count": len(genome.ec_numbers)},
         "requested_count": result.requested_count, "returned_count": len(records),
@@ -245,8 +257,8 @@ def export_results(network: PathwayNetwork, genome: Genome, result: MinimumEcPat
         "route_colors": route_colors_for(range(1, len(records) + 1)) if include_network_svg else {},
         "scope": "按 C 编号合并的详细代谢图及明确 TCA 接点；排除 HTTP 404 图和路线内部循环依赖，仅搜索有 EC 注释的边。",
         "notes": ["同一步多个 EC 按 OR 选项处理，同一补充 EC 用于多步只计一次。",
-                  "每条反应路线只输出一组最优 EC 覆盖，不表示所需基因数。",
-                  "前 N 条已确定不表示全部路线穷尽；数据异常时只报告当前网络候选。",
+                  "同一路线保留全部并列最少 EC 覆盖；同一集合只展示一条最短合法代表路线，不表示所需基因数。",
+                  "前 N 套已确定不表示全部方案穷尽；数据异常时只报告当前网络候选。",
                   "未验证其他共底物供应、计量、碳流、表达及酶的底物适用性；未发现内部循环不等于有效合成方案。"],
     }
     network_data = {
@@ -269,7 +281,7 @@ def export_results(network: PathwayNetwork, genome: Genome, result: MinimumEcPat
         try:
             graph = _route_graph(network, record, edges)
             export_network_svg(graph, directory / name,
-                               title=f"Candidate {record['rank']}: {record['start_id']} to {network.target_id}")
+                               title=f"Scheme {record['rank']}: {record['start_id']} to {network.target_id}")
             record["svg_file"] = name
             artifacts[name] = directory / name
         except (RuntimeError, OSError, ValueError) as error:
@@ -281,6 +293,8 @@ def export_results(network: PathwayNetwork, genome: Genome, result: MinimumEcPat
         try:
             graph = network.graph.copy()
             graph.graph["target_id"] = network.target_id
+            graph.graph["candidate_unit"] = "extra_ec_set"
+            graph.graph["candidate_extra_ecs"] = {record["rank"]: record["extra_ecs"] for record in records}
             export_network_svg(graph, directory / "network.svg", overview=True,
                                highlighted_paths={record["rank"]: edges for record, edges in
                                                   zip(records, paths, strict=True)},
@@ -292,7 +306,7 @@ def export_results(network: PathwayNetwork, genome: Genome, result: MinimumEcPat
             logger.error("完整网络 SVG 导出失败：%s", error)
     _write_json(artifacts["result.json"], report)
     _write_report(artifacts["report.md"], report)
-    logger.info("结果导出完成：%d 条候选，%d 个导出错误", len(records), len(report["export_errors"]))
+    logger.info("结果导出完成：%d 套补酶方案，%d 个导出错误", len(records), len(report["export_errors"]))
     logger.debug("输出目录：%s", directory)
     if report["export_errors"]:
         raise ResultExportError(f"{len(report['export_errors'])} 张 SVG 导出失败；JSON 和报告已保存在 {directory}")

@@ -107,6 +107,20 @@ def _name_lines(name):
     return textwrap.wrap(name, width=28, break_long_words=True, break_on_hyphens=True)
 
 
+def _supplement_ecs(value):
+    """Normalize the selected EC set without altering reaction annotations."""
+    if isinstance(value, (str, bytes)):
+        raise ValueError("Supplement ECs must be a collection of EC identifiers")
+    result = sorted(set(value))
+    if any(not isinstance(ec, str) or not ec for ec in result):
+        raise ValueError("Supplement ECs must contain nonempty EC identifiers")
+    return result
+
+
+def _supplement_label(ecs):
+    return "Supplement ECs: " + (", ".join(ecs) or "none")
+
+
 def _prepare_export(graph, title=None, *, overview=False, highlighted_paths=None):
     if not isinstance(graph, nx.MultiDiGraph):
         raise TypeError("graph must be a networkx.MultiDiGraph")
@@ -178,6 +192,10 @@ def _prepare_export(graph, title=None, *, overview=False, highlighted_paths=None
     subtitle = (f"{len(nodes)} unique compounds | {len(edges)} reaction edges | filled circles: TCA-linked compounds"
                 if compound_graph else
                 f"{len(nodes)} compound nodes | {len(edges)} directed edges | solid: reactions; dashed: map links")
+    scheme_mode = graph.graph.get("candidate_unit") == "extra_ec_set"
+    if scheme_mode:
+        supplement = _supplement_label(_supplement_ecs(graph.graph.get("extra_ecs", ())))
+        subtitle += "\n" + "\n".join(textwrap.wrap(supplement, width=88, break_long_words=False, break_on_hyphens=False))
     node_spacing = "0.16" if any(record["compound_name"] for record in records.values()) else "0.5"
     lines = ["digraph PathFiller {", "  graph [rankdir=LR, compound=true, newrank=true, splines=spline,",
              f"         nodesep={node_spacing}, ranksep=1.0, pad=0.22, bgcolor=white,",
@@ -241,6 +259,9 @@ def _prepare_export(graph, title=None, *, overview=False, highlighted_paths=None
                 "graph": _json_value(graph.graph), "nodes": list(records.values()), "edges": edge_records}
     if compound_graph:
         metadata.update(representation="compound", schema_version=2)
+    if scheme_mode:
+        metadata["candidate_unit"] = "extra_ec_set"
+        metadata["extra_ecs"] = _supplement_ecs(graph.graph.get("extra_ecs", ()))
     return "\n".join(lines) + "\n", metadata, records, edge_records, heading
 
 
@@ -256,6 +277,10 @@ def _prepare_overview(graph, nodes, edges, records, edge_records, title, highlig
     members = defaultdict(set)
     node_members = defaultdict(set)
     route_records = []
+    scheme_mode = graph.graph.get("candidate_unit") == "extra_ec_set"
+    scheme_ecs = graph.graph.get("candidate_extra_ecs", {})
+    if scheme_mode and not isinstance(scheme_ecs, Mapping):
+        raise ValueError("candidate_extra_ecs must map scheme ranks to selected EC sets")
     for rank in sorted(highlighted_paths):
         selected, previous = [], None
         for edge in highlighted_paths[rank]:
@@ -279,8 +304,13 @@ def _prepare_overview(graph, nodes, edges, records, edge_records, title, highlig
                 target = next(iter(graph))
             if target in graph:
                 node_members[target].add(rank)
-        route_records.append({"rank": rank, "color": colours[rank], "reaction_steps": len(selected),
-                              "edges": _json_value(selected)})
+        route = {"rank": rank, "color": colours[rank], "reaction_steps": len(selected),
+                 "edges": _json_value(selected)}
+        if scheme_mode:
+            if rank not in scheme_ecs and str(rank) not in scheme_ecs:
+                raise ValueError(f"Missing supplementary EC set for scheme {rank}")
+            route["extra_ecs"] = _supplement_ecs(scheme_ecs.get(rank, scheme_ecs.get(str(rank))))
+        route_records.append(route)
     for key, record in records.items():
         record["candidate_ranks"] = sorted(node_members[key])
     for (source, target, key, attributes), record in zip(edges, edge_records, strict=True):
@@ -316,6 +346,8 @@ def _prepare_overview(graph, nodes, edges, records, edge_records, title, highlig
                 "directed": True, "multigraph": True, "overview": True, "layout_engine": "sfdp",
                 "graph": _json_value(graph.graph), "nodes": list(records.values()), "edges": edge_records,
                 "route_colors": {str(rank): colour for rank, colour in colours.items()}, "routes": route_records}
+    if scheme_mode:
+        metadata["candidate_unit"] = "extra_ec_set"
     return "\n".join(lines) + "\n", metadata, records, edge_records, heading
 
 
@@ -331,6 +363,10 @@ def _annotate_svg(svg_text, metadata, nodes, edges, heading):
     if overview:
         root.set("data-overview", "true")
         root.set("data-route-colors", _json_text(metadata["route_colors"]))
+    if metadata.get("candidate_unit") == "extra_ec_set":
+        root.set("data-candidate-unit", "extra_ec_set")
+        if not overview:
+            root.set("data-extra-ecs", _json_text(metadata["extra_ecs"]))
     root.set("aria-labelledby", "pathfiller-title pathfiller-description")
     root.insert(0, ET.Element(f"{{{SVG}}}title", {"id": "pathfiller-title"}))
     root[0].text = heading
@@ -412,9 +448,10 @@ def _annotate_svg(svg_text, metadata, nodes, edges, heading):
             group.set("data-candidate-ranks", _json_text(record["candidate_ranks"]))
             group.set("data-route-colors", _json_text(record["route_colors"]))
             matched = _field(record["attributes"].get("connection"), "is_endogenous")
+            unit = "方案" if metadata.get("candidate_unit") == "extra_ec_set" else "候选"
             _set_title(group, "EC: " + (", ".join(record["ec_numbers"]) or "未知") +
                        "\nR: " + (", ".join(record["reaction_ids"]) or "未知") +
-                       "\n候选: " + (", ".join(map(str, record["candidate_ranks"])) or "无") +
+                       f"\n{unit}: " + (", ".join(map(str, record["candidate_ranks"])) or "无") +
                        "\n宿主匹配: " + ("是" if matched else ("否" if matched is False else "未评估")))
             continue
         _set_title(group, _json_text(record))
@@ -751,6 +788,7 @@ def _overview_legend(root, metadata):
     bounds = [float(value) for value in root.get("viewBox", "0 0 360 80").split()]
     x, y, width, height = bounds
     routes = metadata["routes"]
+    scheme_mode = metadata.get("candidate_unit") == "extra_ec_set"
     rows = len(routes) if routes else 1
     extra = 50 + rows * 24 + (24 if not metadata["nodes"] else 0)
     width = max(width, 360)
@@ -762,22 +800,25 @@ def _overview_legend(root, metadata):
         "transform": f"translate({x + 18:g} {y + height + 20:g})",
         "font-family": "Arial", "font-size": "13", "fill": _INK,
     })
-    ET.SubElement(legend, f"{{{SVG}}}text", {"x": "0", "y": "0"}).text = "Candidate routes"
+    ET.SubElement(legend, f"{{{SVG}}}text", {"x": "0", "y": "0"}).text = "EC supplementation schemes" if scheme_mode else "Candidate routes"
     for index, route in enumerate(routes, 1):
         group = ET.SubElement(legend, f"{{{SVG}}}g", {
             "id": f"route-legend-{route['rank']}", "data-candidate-rank": str(route["rank"]),
             "data-route-color": route["color"],
         })
+        if scheme_mode:
+            group.set("data-extra-ecs", _json_text(route["extra_ecs"]))
+            _set_title(group, f"Scheme {route['rank']}\n" + _supplement_label(route["extra_ecs"]))
         baseline = index * 24
         ET.SubElement(group, f"{{{SVG}}}line", {
             "x1": "0", "x2": "28", "y1": str(baseline - 4), "y2": str(baseline - 4),
             "stroke": route["color"], "stroke-width": "3",
         })
         steps = route["reaction_steps"]
-        label = f"Candidate {route['rank']}: {steps} steps" + (" (target only)" if steps == 0 else "")
+        label = f"{'Scheme' if scheme_mode else 'Candidate'} {route['rank']}: {steps} steps" + (" (target only)" if steps == 0 else "")
         ET.SubElement(group, f"{{{SVG}}}text", {"x": "38", "y": str(baseline)}).text = label
     if not routes:
-        ET.SubElement(legend, f"{{{SVG}}}text", {"x": "0", "y": "24"}).text = "No candidate routes"
+        ET.SubElement(legend, f"{{{SVG}}}text", {"x": "0", "y": "24"}).text = "No supplementation schemes" if scheme_mode else "No candidate routes"
     if not metadata["nodes"]:
         ET.SubElement(legend, f"{{{SVG}}}text", {"x": "0", "y": str((rows + 1) * 24)}).text = "No network compounds available"
 
